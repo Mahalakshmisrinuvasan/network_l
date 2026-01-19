@@ -1,0 +1,252 @@
+import os
+import json
+import re
+import numpy as np
+import faiss
+import pdfplumber
+import pytesseract
+import camelot
+from sentence_transformers import SentenceTransformer
+from groq import Groq
+
+# ================= CONFIG =================
+pytesseract.pytesseract.tesseract_cmd = r"C:\standard_compliance_chatbot\tesseract.exe"
+
+llm = Groq(api_key="")  # 🔑 ADD YOUR GROQ KEY HERE
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+
+TOP_K = 6
+CHUNK_SIZE = 900
+MAX_CONTEXT_CHARS = 3200
+
+# ================= STORAGE =================
+STORAGE_DIR = "storage"
+DOCS_DIR = os.path.join(STORAGE_DIR, "documents")
+FAISS_PATH = os.path.join(STORAGE_DIR, "faiss.index")
+META_PATH = os.path.join(STORAGE_DIR, "metadata.json")
+
+os.makedirs(DOCS_DIR, exist_ok=True)
+
+# ================= LOAD INDEX =================
+if os.path.exists(FAISS_PATH) and os.path.exists(META_PATH):
+    index = faiss.read_index(FAISS_PATH)
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        metadata_store = json.load(f)
+else:
+    index = None
+    metadata_store = []
+
+# ================= OCR CLEANER =================
+def clean_ocr(text):
+    text = re.sub(r'(.)\1{2,}', r'\1', text)
+    text = re.sub(r'[^\w\s\.,\-/()]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# ================= PDF EXTRACTION =================
+def extract_pdf(file_path):
+    pages = []
+    with pdfplumber.open(file_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text()
+            if text and len(text.strip()) > 50:
+                pages.append((text, i))
+                continue
+            try:
+                img = page.to_image(resolution=200).original.convert("L")
+                ocr = pytesseract.image_to_string(img, config="--psm 6")
+                ocr = clean_ocr(ocr)
+                if len(ocr) > 50:
+                    pages.append((ocr, i))
+            except:
+                pass
+    return pages
+
+# ================= TABLE EXTRACTION =================
+def extract_tables(pdf_path):
+    out = []
+    try:
+        tables = camelot.read_pdf(pdf_path, pages="all", flavor="stream")
+        for t in tables:
+            text = "\n".join([" | ".join(row) for row in t.df.values])
+            if len(text.strip()) > 50:
+                out.append((text, t.page))
+    except:
+        pass
+    return out
+
+# ================= INGEST PDF (CALLED BY FRONTEND) =================
+def ingest_pdf(uploaded_file):
+    global index, metadata_store
+
+    path = os.path.join(DOCS_DIR, uploaded_file.name)
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+    pages = extract_pdf(path)
+    tables = extract_tables(path)
+
+    chunks, meta = [], []
+
+    for text, page in pages:
+        for i in range(0, len(text), CHUNK_SIZE):
+            chunk = text[i:i+CHUNK_SIZE].strip()
+            if chunk:
+                chunks.append(chunk)
+                meta.append({
+                    "document": uploaded_file.name,
+                    "page": page,
+                    "text": chunk
+                })
+
+    for table, page in tables:
+        chunks.append(table)
+        meta.append({
+            "document": uploaded_file.name,
+            "page": page,
+            "text": table
+        })
+
+    if not chunks:
+        return False
+
+    vectors = embedder.encode(chunks)
+
+    if index is None:
+        index = faiss.IndexFlatL2(vectors.shape[1])
+
+    index.add(np.array(vectors))
+    metadata_store.extend(meta)
+
+    faiss.write_index(index, FAISS_PATH)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(metadata_store, f, indent=2)
+
+    return True
+
+# ================= QUESTION TYPE =================
+def question_type(q):
+    q = q.lower()
+    if any(k in q for k in ["standard", "iso", "asme", "api", "comply"]):
+        return "COMPLIANCE"
+    if any(k in q for k in ["why", "explain", "how", "purpose", "define"]):
+        return "EXPLAIN"
+    if any(k in q for k in ["list", "types"]):
+        return "LIST"
+    return "GENERAL"
+
+# ================= ASK QUESTION (CALLED BY FRONTEND) =================
+def ask_question(question, mode="Auto", active_document="All Documents"):
+    global index, metadata_store
+
+    if index is None or not metadata_store:
+        return "No documents indexed yet.", []
+
+    qtype = question_type(question)
+
+    # -------- AUTO MODE ROUTING --------
+    if mode == "Auto":
+        mode_used = "Strict" if qtype == "COMPLIANCE" else "Assist"
+    else:
+        mode_used = mode
+
+    # -------- VECTOR SEARCH --------
+    q_vec = embedder.encode([question])
+    k = 2 if mode_used == "Strict" else TOP_K
+    _, ids = index.search(np.array(q_vec), k)
+
+    # -------- CONTEXT BUILD (DOCUMENT FILTER) --------
+    context, sources = "", set()
+
+    for i in ids[0]:
+        if i >= len(metadata_store):
+            continue
+
+        meta = metadata_store[i]
+
+        # ✅ DOCUMENT SCOPE FILTER
+        if active_document != "All Documents":
+            if meta["document"] != active_document:
+                continue
+
+        context += meta["text"] + "\n"
+        sources.add(f"{meta['document']} (page {meta['page']})")
+
+        if len(context) > MAX_CONTEXT_CHARS:
+            break
+
+    if not context.strip():
+        return "No relevant content found in the selected document.", []
+
+    # -------- PROMPT --------
+    if mode_used == "Strict":
+        prompt = f"""
+STRICT COMPLIANCE MODE.
+
+Rules:
+- Use ONLY exact statements from the document.
+- If not explicitly stated, respond exactly:
+  "Not explicitly stated in the document."
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+    else:
+        prompt = f"""
+You are an engineering document assistant.
+Explain clearly using ONLY document content.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    resp = llm.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    answer = resp.choices[0].message.content.strip()
+    return answer, sorted(sources)
+
+def remove_document(document_name):
+    global index, metadata_store
+
+    # 1️⃣ Remove metadata entries
+    new_meta = [m for m in metadata_store if m["document"] != document_name]
+
+    if len(new_meta) == len(metadata_store):
+        return False  # document not found
+
+    metadata_store = new_meta
+
+    # 2️⃣ Rebuild FAISS index
+    texts = [m["text"] for m in metadata_store]
+
+    if texts:
+        vectors = embedder.encode(texts)
+        index = faiss.IndexFlatL2(vectors.shape[1])
+        index.add(np.array(vectors))
+        faiss.write_index(index, FAISS_PATH)
+    else:
+        index = None
+        if os.path.exists(FAISS_PATH):
+            os.remove(FAISS_PATH)
+
+    # 3️⃣ Save updated metadata
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(metadata_store, f, indent=2)
+
+    # 4️⃣ Remove PDF file
+    pdf_path = os.path.join(DOCS_DIR, document_name)
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
+
+    return True
